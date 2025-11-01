@@ -3,23 +3,29 @@ import json
 import zipfile
 import tempfile
 import requests
+import yt_dlp
 from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS  # Add this for cross-origin requests
+from flask_cors import CORS
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyClientCredentials
 from dotenv import load_dotenv
+import threading
+from collections import defaultdict
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
 # Initialize Spotify client
 sp = Spotify(client_credentials_manager=SpotifyClientCredentials(
     client_id=os.getenv('SPOTIPY_CLIENT_ID'),
     client_secret=os.getenv('SPOTIPY_CLIENT_SECRET')
 ))
+
+# Store download progress
+download_progress = defaultdict(dict)
 
 def extract_spotify_id(url, type):
     """Extract Spotify ID from URL"""
@@ -56,15 +62,55 @@ def format_duration(ms):
     minutes = int((ms / (1000 * 60)) % 60)
     return f"{minutes}:{seconds:02d}"
 
-def download_preview(url, filename):
-    """Download preview MP3 file"""
+def search_youtube_query(track_name, artist_name):
+    """Create search query for YouTube"""
+    return f"{track_name} {artist_name} official audio"
+
+def download_full_song(track_info, download_id):
+    """Download full song from YouTube using yt-dlp"""
     try:
-        response = requests.get(url, stream=True)
-        if response.status_code == 200:
-            return response.content
+        query = search_youtube_query(track_info['name'], track_info['artists'][0]['name'])
+        
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': os.path.join(tempfile.gettempdir(), f'{download_id}_%(title)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '320',
+            }],
+            'progress_hooks': [lambda d: progress_hook(d, download_id)],
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            download_progress[download_id]['status'] = 'searching'
+            download_progress[download_id]['progress'] = 0
+            
+            # Search and download
+            ydl.download([f"ytsearch:{query}"])
+            
+            download_progress[download_id]['status'] = 'completed'
+            download_progress[download_id]['progress'] = 100
+            
     except Exception as e:
-        print(f"Error downloading preview: {e}")
-    return None
+        download_progress[download_id]['status'] = 'error'
+        download_progress[download_id]['error'] = str(e)
+
+def progress_hook(d, download_id):
+    """Progress hook for yt-dlp"""
+    if d['status'] == 'downloading':
+        if '_percent_str' in d:
+            percent = d['_percent_str'].strip().replace('%', '')
+            try:
+                download_progress[download_id]['progress'] = float(percent)
+                download_progress[download_id]['status'] = 'downloading'
+            except:
+                download_progress[download_id]['progress'] = 0
+    elif d['status'] == 'finished':
+        download_progress[download_id]['filename'] = d['filename']
+        download_progress[download_id]['status'] = 'processing'
 
 @app.route('/')
 def index():
@@ -72,8 +118,9 @@ def index():
         'message': 'SpotiDL API is running!',
         'endpoints': {
             'POST /api/fetch': 'Fetch Spotify metadata',
-            'GET /api/download/<type>/<id>': 'Download previews ZIP',
-            'GET /api/download/track/<id>': 'Download single track preview'
+            'POST /api/download/full/track': 'Download full track from YouTube',
+            'GET /api/download/progress/<download_id>': 'Check download progress',
+            'GET /api/download/file/<download_id>': 'Download completed file'
         }
     })
 
@@ -111,7 +158,8 @@ def fetch_spotify_data():
                 'preview_url': track['preview_url'],
                 'external_url': track['external_urls']['spotify'],
                 'composers': [artist['name'] for artist in track['artists']],
-                'genres': album.get('genres', [])
+                'genres': album.get('genres', []),
+                'spotify_id': track['id']
             })
 
         elif spotify_type == 'album':
@@ -128,7 +176,8 @@ def fetch_spotify_data():
                     'duration_ms': item['duration_ms'],
                     'track_number': item['track_number'],
                     'preview_url': item['preview_url'],
-                    'external_url': item['external_urls']['spotify']
+                    'external_url': item['external_urls']['spotify'],
+                    'spotify_id': item['id']
                 }
                 album_tracks.append(track_data)
 
@@ -140,7 +189,8 @@ def fetch_spotify_data():
                 'cover_art': album['images'][0]['url'] if album['images'] else None,
                 'external_url': album['external_urls']['spotify'],
                 'genres': album.get('genres', []),
-                'tracks': album_tracks
+                'tracks': album_tracks,
+                'spotify_id': album['id']
             })
 
         elif spotify_type == 'playlist':
@@ -159,7 +209,8 @@ def fetch_spotify_data():
                         'duration_ms': track['duration_ms'],
                         'album': track['album']['name'],
                         'preview_url': track['preview_url'],
-                        'external_url': track['external_urls']['spotify']
+                        'external_url': track['external_urls']['spotify'],
+                        'spotify_id': track['id']
                     }
                     playlist_tracks.append(track_data)
 
@@ -170,7 +221,8 @@ def fetch_spotify_data():
                 'total_tracks': playlist['tracks']['total'],
                 'cover_art': playlist['images'][0]['url'] if playlist['images'] else None,
                 'external_url': playlist['external_urls']['spotify'],
-                'tracks': playlist_tracks
+                'tracks': playlist_tracks,
+                'spotify_id': playlist['id']
             })
 
         return jsonify(result)
@@ -178,6 +230,68 @@ def fetch_spotify_data():
     except Exception as e:
         return jsonify({'error': f'Failed to fetch data: {str(e)}'}), 500
 
+@app.route('/api/download/full/track', methods=['POST'])
+def download_full_track():
+    try:
+        data = request.get_json()
+        spotify_id = data.get('spotify_id')
+        
+        if not spotify_id:
+            return jsonify({'error': 'No track ID provided'}), 400
+        
+        # Get track info from Spotify
+        track = sp.track(spotify_id)
+        
+        # Generate unique download ID
+        download_id = f"full_{spotify_id}_{int(threading.current_thread().ident)}"
+        
+        # Start download in background thread
+        thread = threading.Thread(
+            target=download_full_song,
+            args=(track, download_id)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            'download_id': download_id,
+            'track_name': track['name'],
+            'artists': [artist['name'] for artist in track['artists']],
+            'status': 'started'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': f'Failed to start download: {str(e)}'}), 500
+
+@app.route('/api/download/progress/<download_id>')
+def get_download_progress(download_id):
+    progress = download_progress.get(download_id, {})
+    return jsonify(progress)
+
+@app.route('/api/download/file/<download_id>')
+def download_file(download_id):
+    try:
+        progress = download_progress.get(download_id, {})
+        
+        if progress.get('status') != 'completed':
+            return jsonify({'error': 'Download not completed'}), 400
+        
+        filename = progress.get('filename', '').replace('.webm', '.mp3').replace('.m4a', '.mp3')
+        
+        if not os.path.exists(filename):
+            return jsonify({'error': 'File not found'}), 404
+        
+        # Clean up the progress entry
+        if download_id in download_progress:
+            del download_progress[download_id]
+        
+        safe_name = f"{os.path.basename(filename)}"
+        return send_file(filename, as_attachment=True, download_name=safe_name)
+        
+    except Exception as e:
+        return jsonify({'error': f'Failed to download file: {str(e)}'}), 500
+
+# Keep the existing preview download endpoints
 @app.route('/api/download/<spotify_type>/<spotify_id>')
 def download_previews(spotify_type, spotify_id):
     try:
@@ -198,13 +312,17 @@ def download_previews(spotify_type, spotify_id):
             for item in tracks_data['items']:
                 track = item['track'] if spotify_type == 'playlist' else item
                 if track and track.get('preview_url'):
-                    audio_content = download_preview(track['preview_url'], f"{track['id']}.mp3")
-                    if audio_content:
-                        safe_name = f"{track['name']} - {', '.join([a['name'] for a in track['artists']])}.mp3"
-                        safe_name = "".join(c for c in safe_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
-                        zipf.writestr(safe_name, audio_content)
+                    try:
+                        audio_content = download_preview(track['preview_url'])
+                        if audio_content:
+                            safe_name = f"{track['name']} - {', '.join([a['name'] for a in track['artists']])}.mp3"
+                            safe_name = "".join(c for c in safe_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                            zipf.writestr(safe_name, audio_content)
+                    except Exception as e:
+                        print(f"Error downloading {track['name']}: {e}")
+                        continue
 
-        return send_file(zip_path, as_attachment=True, download_name=f'spotiDL_{title}.zip')
+        return send_file(zip_path, as_attachment=True, download_name=f'spotiDL_{title}_previews.zip')
 
     except Exception as e:
         return jsonify({'error': f'Failed to create download: {str(e)}'}), 500
@@ -216,7 +334,7 @@ def download_track_preview(track_id):
         if not track.get('preview_url'):
             return jsonify({'error': 'No preview available for this track'}), 404
 
-        audio_content = download_preview(track['preview_url'], f"{track_id}.mp3")
+        audio_content = download_preview(track['preview_url'])
         if audio_content:
             safe_name = f"{track['name']} - {', '.join([a['name'] for a in track['artists']])}.mp3"
             safe_name = "".join(c for c in safe_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
@@ -231,6 +349,16 @@ def download_track_preview(track_id):
 
     except Exception as e:
         return jsonify({'error': f'Failed to download track: {str(e)}'}), 500
+
+def download_preview(url):
+    """Download preview MP3 file"""
+    try:
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            return response.content
+    except Exception as e:
+        print(f"Error downloading preview: {e}")
+    return None
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
