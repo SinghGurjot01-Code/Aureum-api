@@ -3,22 +3,23 @@ import json
 import zipfile
 import tempfile
 import requests
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS  # Add this for cross-origin requests
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyClientCredentials
 from dotenv import load_dotenv
 
-# Load environment variables (useful for local testing)
+# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
 # Initialize Spotify client
 sp = Spotify(client_credentials_manager=SpotifyClientCredentials(
     client_id=os.getenv('SPOTIPY_CLIENT_ID'),
     client_secret=os.getenv('SPOTIPY_CLIENT_SECRET')
 ))
-
 
 def extract_spotify_id(url, type):
     """Extract Spotify ID from URL"""
@@ -39,7 +40,6 @@ def extract_spotify_id(url, type):
         return url
     return None
 
-
 def detect_spotify_type(url):
     """Detect if URL is track, album, or playlist"""
     if 'track' in url:
@@ -50,13 +50,11 @@ def detect_spotify_type(url):
         return 'playlist'
     return None
 
-
 def format_duration(ms):
     """Convert milliseconds to minutes:seconds"""
     seconds = int((ms / 1000) % 60)
     minutes = int((ms / (1000 * 60)) % 60)
     return f"{minutes}:{seconds:02d}"
-
 
 def download_preview(url, filename):
     """Download preview MP3 file"""
@@ -68,11 +66,16 @@ def download_preview(url, filename):
         print(f"Error downloading preview: {e}")
     return None
 
-
 @app.route('/')
 def index():
-    return render_template('index.html')
-
+    return jsonify({
+        'message': 'SpotiDL API is running!',
+        'endpoints': {
+            'POST /api/fetch': 'Fetch Spotify metadata',
+            'GET /api/download/<type>/<id>': 'Download previews ZIP',
+            'GET /api/download/track/<id>': 'Download single track preview'
+        }
+    })
 
 @app.route('/api/fetch', methods=['POST'])
 def fetch_spotify_data():
@@ -175,7 +178,6 @@ def fetch_spotify_data():
     except Exception as e:
         return jsonify({'error': f'Failed to fetch data: {str(e)}'}), 500
 
-
 @app.route('/api/download/<spotify_type>/<spotify_id>')
 def download_previews(spotify_type, spotify_id):
     try:
@@ -207,7 +209,6 @@ def download_previews(spotify_type, spotify_id):
     except Exception as e:
         return jsonify({'error': f'Failed to create download: {str(e)}'}), 500
 
-
 @app.route('/api/download/track/<track_id>')
 def download_track_preview(track_id):
     try:
@@ -230,7 +231,6 @@ def download_track_preview(track_id):
 
     except Exception as e:
         return jsonify({'error': f'Failed to download track: {str(e)}'}), 500
-
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
