@@ -31,39 +31,44 @@ download_progress = defaultdict(dict)
 def setup_cookies():
     """Setup YouTube cookies for yt_dlp in Render environment."""
     cookie_path_env = os.getenv('COOKIE_FILE')
-    if cookie_path_env:
-        # If secret file is provided as Render mount (e.g., /etc/secrets/COOKIE_FILE)
-        if os.path.exists(cookie_path_env):
-            print(f"✅ Using COOKIE_FILE from mounted secret: {cookie_path_env}")
-            return cookie_path_env
-
-        # If the environment variable *contains the cookie content itself*
-        if "youtube.com" in cookie_path_env:
-            print("✅ COOKIE_FILE appears to contain raw cookie data.")
-            tmp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+    
+    # If COOKIE_FILE contains raw cookie data (most common case)
+    if cookie_path_env and "youtube.com" in cookie_path_env:
+        print("✅ COOKIE_FILE contains raw cookie data - writing to temp file")
+        try:
+            tmp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_cookies.txt')
             tmp_file.write(cookie_path_env)
             tmp_file.close()
             print(f"✅ Wrote cookies to temp file: {tmp_file.name}")
             return tmp_file.name
-
-    # Try /etc/secrets/cookies.txt if mounted by Render
-    etc_path = "/etc/secrets/COOKIE_FILE"
-    if os.path.exists(etc_path):
-        print(f"✅ Found cookies in {etc_path}")
-        return etc_path
+        except Exception as e:
+            print(f"❌ Failed to write cookie temp file: {e}")
 
     # Try base64 encoded fallback
     cookies_base64 = os.getenv('YOUTUBE_COOKIES_BASE64')
     if cookies_base64:
         try:
             decoded = base64.b64decode(cookies_base64).decode('utf-8')
-            tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+            tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='_cookies.txt')
             tmp.write(decoded)
             tmp.close()
             print(f"✅ Decoded base64 cookies to: {tmp.name}")
             return tmp.name
         except Exception as e:
             print(f"❌ Failed to decode YOUTUBE_COOKIES_BASE64: {e}")
+
+    # Check if we have a readable cookie file (but don't try to write to it)
+    possible_paths = [
+        cookie_path_env,
+        "/etc/secrets/COOKIE_FILE",
+        "/etc/secrets/cookies.txt",
+        "./cookies.txt"
+    ]
+    
+    for path in possible_paths:
+        if path and os.path.exists(path) and os.access(path, os.R_OK):
+            print(f"✅ Using readable cookie file: {path}")
+            return path
 
     print("⚠️ No valid cookie file found. YouTube downloads may be limited.")
     return None
@@ -114,9 +119,12 @@ def progress_hook(d, download_id):
 def download_full_song(track_info, download_id):
     try:
         query = search_youtube_query(track_info['name'], track_info['artists'][0]['name'])
+        
+        # Use temp directory for all downloads
+        temp_dir = tempfile.gettempdir()
         ydl_opts = {
             'format': 'bestaudio/best',
-            'outtmpl': os.path.join(tempfile.gettempdir(), f'{download_id}_%(title)s.%(ext)s'),
+            'outtmpl': os.path.join(temp_dir, f'{download_id}_%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
             'postprocessors': [{
@@ -155,10 +163,23 @@ def download_full_song(track_info, download_id):
 
 @app.route('/')
 def index():
+    cookie_status = 'Available' if COOKIE_FILE and os.path.exists(COOKIE_FILE) else 'Missing'
+    cookie_path = COOKIE_FILE or 'None'
+    
+    # Check if cookie file is readable
+    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE, 'r') as f:
+                first_line = f.readline()
+                cookie_status += f" ({len(first_line)} chars read)"
+        except Exception as e:
+            cookie_status += f" (Read error: {str(e)})"
+    
     return jsonify({
         'message': 'SpotiDL API is live.',
-        'cookies': 'Available' if COOKIE_FILE and os.path.exists(COOKIE_FILE) else 'Missing',
-        'cookie_path': COOKIE_FILE or 'None'
+        'cookies': cookie_status,
+        'cookie_path': cookie_path,
+        'temp_dir_writable': os.access(tempfile.gettempdir(), os.W_OK)
     })
 
 
@@ -263,6 +284,22 @@ def download_file(download_id):
 
     safe_name = os.path.basename(file_path).replace('.webm', '.mp3').replace('.m4a', '.mp3')
     return send_file(file_path, as_attachment=True, download_name=safe_name)
+
+
+# Cleanup function to remove temp files periodically
+def cleanup_temp_files():
+    """Clean up temporary files to prevent disk space issues"""
+    temp_dir = tempfile.gettempdir()
+    try:
+        for filename in os.listdir(temp_dir):
+            if filename.endswith(('_cookies.txt', '.mp3', '.webm', '.m4a')):
+                file_path = os.path.join(temp_dir, filename)
+                # Remove files older than 1 hour
+                if os.path.getmtime(file_path) < (time.time() - 3600):
+                    os.remove(file_path)
+                    print(f"🧹 Cleaned up: {filename}")
+    except Exception as e:
+        print(f"⚠️ Cleanup error: {e}")
 
 
 if __name__ == '__main__':
