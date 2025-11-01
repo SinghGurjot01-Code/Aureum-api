@@ -1,0 +1,6 @@
+flask
+spotipy
+python-dotenv
+requests
+shutil
+gunicorn
