@@ -27,6 +27,9 @@ sp = Spotify(client_credentials_manager=SpotifyClientCredentials(
 # Store download progress
 download_progress = defaultdict(dict)
 
+# Cookie file path
+COOKIE_FILE = '/etc/secrets/cookies.txt'
+
 def extract_spotify_id(url, type):
     """Extract Spotify ID from URL"""
     if 'spotify.com' in url:
@@ -71,6 +74,7 @@ def download_full_song(track_info, download_id):
     try:
         query = search_youtube_query(track_info['name'], track_info['artists'][0]['name'])
         
+        # Base yt-dlp options
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': os.path.join(tempfile.gettempdir(), f'{download_id}_%(title)s.%(ext)s'),
@@ -84,19 +88,65 @@ def download_full_song(track_info, download_id):
             'progress_hooks': [lambda d: progress_hook(d, download_id)],
         }
         
+        # Add cookies if available
+        if os.path.exists(COOKIE_FILE):
+            print(f"Using cookies from: {COOKIE_FILE}")
+            ydl_opts['cookiefile'] = COOKIE_FILE
+        else:
+            print("No cookie file found. Using fallback options...")
+            # Fallback options when no cookies are available
+            ydl_opts.update({
+                'extract_flat': False,
+                'ignoreerrors': True,
+                'no_check_certificate': True,
+                'prefer_ffmpeg': True,
+                'geo_bypass': True,
+            })
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             download_progress[download_id]['status'] = 'searching'
             download_progress[download_id]['progress'] = 0
             
-            # Search and download
-            ydl.download([f"ytsearch:{query}"])
-            
-            download_progress[download_id]['status'] = 'completed'
-            download_progress[download_id]['progress'] = 100
+            try:
+                # Search and download
+                ydl.download([f"ytsearch:{query}"])
+                download_progress[download_id]['status'] = 'completed'
+                download_progress[download_id]['progress'] = 100
+                
+            except Exception as download_error:
+                print(f"Download error: {download_error}")
+                
+                # If download fails, try alternative approach without cookies
+                if 'cookiefile' in ydl_opts:
+                    print("Retrying without cookies...")
+                    try:
+                        # Remove cookies and retry
+                        retry_opts = ydl_opts.copy()
+                        retry_opts.pop('cookiefile', None)
+                        retry_opts.update({
+                            'extract_flat': False,
+                            'ignoreerrors': True,
+                            'no_check_certificate': True,
+                            'prefer_ffmpeg': True,
+                            'geo_bypass': True,
+                        })
+                        
+                        with yt_dlp.YoutubeDL(retry_opts) as ydl_retry:
+                            ydl_retry.download([f"ytsearch:{query}"])
+                            download_progress[download_id]['status'] = 'completed'
+                            download_progress[download_id]['progress'] = 100
+                    except Exception as retry_error:
+                        print(f"Retry also failed: {retry_error}")
+                        download_progress[download_id]['status'] = 'error'
+                        download_progress[download_id]['error'] = f"Download failed: {str(retry_error)}"
+                else:
+                    download_progress[download_id]['status'] = 'error'
+                    download_progress[download_id]['error'] = f"Download failed: {str(download_error)}"
             
     except Exception as e:
+        print(f"Unexpected error in download_full_song: {e}")
         download_progress[download_id]['status'] = 'error'
-        download_progress[download_id]['error'] = str(e)
+        download_progress[download_id]['error'] = f"Unexpected error: {str(e)}"
 
 def progress_hook(d, download_id):
     """Progress hook for yt-dlp"""
@@ -121,7 +171,8 @@ def index():
             'POST /api/download/full/track': 'Download full track from YouTube',
             'GET /api/download/progress/<download_id>': 'Check download progress',
             'GET /api/download/file/<download_id>': 'Download completed file'
-        }
+        },
+        'cookies_status': 'Available' if os.path.exists(COOKIE_FILE) else 'Not found'
     })
 
 @app.route('/api/fetch', methods=['POST'])
@@ -257,7 +308,8 @@ def download_full_track():
             'download_id': download_id,
             'track_name': track['name'],
             'artists': [artist['name'] for artist in track['artists']],
-            'status': 'started'
+            'status': 'started',
+            'cookies_used': os.path.exists(COOKIE_FILE)
         })
         
     except Exception as e:
