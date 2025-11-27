@@ -92,6 +92,7 @@ async def get_stream_url(videoId: str):
         if not videoId:
             raise HTTPException(status_code=400, detail="videoId parameter is required")
         
+        cookies_file = "/etc/secrets/cookies.txt"
         ydl_opts = {
             'format': 'bestaudio/best',
             'quiet': True,
@@ -100,6 +101,11 @@ async def get_stream_url(videoId: str):
             'audioformat': 'mp3',
             'noplaylist': True,
         }
+        
+        # Add cookies to yt-dlp if available
+        if os.path.exists(cookies_file):
+            ydl_opts['cookiefile'] = cookies_file
+            print("Using cookies for yt-dlp stream extraction")
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Get video info without downloading
@@ -137,7 +143,13 @@ async def get_stream_url(videoId: str):
             }
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stream URL extraction failed: {str(e)}")
+        error_msg = str(e)
+        if "Sign in to confirm you're not a bot" in error_msg:
+            raise HTTPException(
+                status_code=403, 
+                detail="YouTube requires authentication. Please ensure cookies.txt is properly formatted and contains valid YouTube session cookies."
+            )
+        raise HTTPException(status_code=500, detail=f"Stream URL extraction failed: {error_msg}")
 
 @app.get("/health")
 async def health_check():
@@ -151,20 +163,98 @@ async def cookies_status():
     cookies_file = "/etc/secrets/cookies.txt"
     cookies_exists = os.path.exists(cookies_file)
     
+    # Check cookies file content
+    cookies_content = None
+    if cookies_exists:
+        try:
+            with open(cookies_file, 'r') as f:
+                cookies_content = f.read()
+        except Exception as e:
+            cookies_content = f"Error reading file: {e}"
+    
     try:
         # Test if YTMusic is working with current auth
         test_search = ytmusic.search("test", limit=1)
-        cookies_working = True
+        ytmusic_working = True
+        ytmusic_error = None
     except Exception as e:
-        cookies_working = False
-        test_error = str(e)
+        ytmusic_working = False
+        ytmusic_error = str(e)
+    
+    # Test yt-dlp with cookies
+    ytdlp_working = False
+    ytdlp_error = None
+    try:
+        test_ydl_opts = {'quiet': True, 'no_warnings': True}
+        if cookies_exists:
+            test_ydl_opts['cookiefile'] = cookies_file
+        
+        with yt_dlp.YoutubeDL(test_ydl_opts) as ydl:
+            # Try to get info for a simple video
+            info = ydl.extract_info("https://www.youtube.com/watch?v=GC3d_sY-qwM", download=False)
+            ytdlp_working = True
+    except Exception as e:
+        ytdlp_error = str(e)
     
     return {
         "cookies_file_exists": cookies_exists,
         "cookies_file_path": cookies_file,
-        "cookies_working": cookies_working,
-        "error": test_error if not cookies_working else None
+        "cookies_file_size": len(cookies_content) if cookies_content else 0,
+        "ytmusic_working": ytmusic_working,
+        "ytmusic_error": ytmusic_error,
+        "ytdlp_working": ytdlp_working,
+        "ytdlp_error": ytdlp_error,
+        "cookies_preview": cookies_content[:500] + "..." if cookies_content and len(cookies_content) > 500 else cookies_content
     }
+
+@app.get("/test-stream")
+async def test_stream():
+    """
+    Test endpoint to check if streaming works with a known video
+    """
+    test_video_id = "GC3d_sY-qwM"  # YouTube's test video
+    try:
+        cookies_file = "/etc/secrets/cookies.txt"
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        if os.path.exists(cookies_file):
+            ydl_opts['cookiefile'] = cookies_file
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(
+                f"https://www.youtube.com/watch?v={test_video_id}",
+                download=False
+            )
+            
+            audio_url = None
+            if 'url' in info:
+                audio_url = info['url']
+            elif 'formats' in info:
+                audio_formats = [f for f in info['formats'] if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+                if audio_formats:
+                    audio_formats.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
+                    audio_url = audio_formats[0]['url']
+            
+            return {
+                "success": True,
+                "video_id": test_video_id,
+                "has_audio_url": audio_url is not None,
+                "title": info.get('title'),
+                "duration": info.get('duration'),
+                "cookies_used": os.path.exists(cookies_file)
+            }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "video_id": test_video_id,
+            "error": str(e),
+            "cookies_used": os.path.exists("/etc/secrets/cookies.txt")
+        }
 
 if __name__ == "__main__":
     import uvicorn
