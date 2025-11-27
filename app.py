@@ -4,15 +4,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import ytmusicapi
 import yt_dlp
-import asyncio
-import aiohttp
 import os
-from typing import List, Optional
-import json
 
 app = FastAPI(title="Aureum Music API")
 
-# CORS middleware
+# -------------------------------
+# CORS CONFIG
+# -------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,21 +19,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Path to Render secret file
+# -------------------------------
+# COOKIE FILE HANDLING
+# -------------------------------
 COOKIES_PATH = "/etc/secrets/cookies.txt"
 
 if not os.path.exists(COOKIES_PATH):
-    raise RuntimeError(f"Cookies file missing at {COOKIES_PATH}. Upload cookies.txt in Render Secrets.")
+    raise RuntimeError(
+        f"cookies.txt not found at {COOKIES_PATH}. "
+        f"Upload cookies.txt in Render → Secret Files."
+    )
 
-# Initialize ytmusicapi with cookies
-ytmusic = ytmusicapi.YTMusic(COOKIES_PATH)
+# Correct initialization (cookiefile= — not JSON)
+try:
+    ytmusic = ytmusicapi.YTMusic(cookiefile=COOKIES_PATH)
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize YTMusic with cookies: {str(e)}")
 
+# -------------------------------
+# ROUTES
+# -------------------------------
 @app.get("/")
 async def root():
     return {"message": "Aureum Music API - Premium Streaming Service"}
 
+
+# -------------------------------
+# SEARCH ENDPOINT
+# -------------------------------
 @app.get("/search")
 async def search_music(q: str, limit: int = 20):
+    """
+    Search music on YouTube Music
+    """
     try:
         if not q.strip():
             raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
@@ -44,14 +60,20 @@ async def search_music(q: str, limit: int = 20):
 
         formatted_results = []
         for r in search_results:
+            # Parse duration
             duration_sec = 0
             if r.get("duration"):
                 parts = r["duration"].split(":")
                 if len(parts) == 2:
-                    duration_sec = int(parts[0])*60 + int(parts[1])
+                    duration_sec = int(parts[0]) * 60 + int(parts[1])
                 elif len(parts) == 3:
-                    duration_sec = int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+                    duration_sec = (
+                        int(parts[0]) * 3600
+                        + int(parts[1]) * 60
+                        + int(parts[2])
+                    )
 
+            # Parse artists
             artists = [a["name"] for a in r.get("artists", [])]
 
             formatted_results.append({
@@ -69,8 +91,14 @@ async def search_music(q: str, limit: int = 20):
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
+# -------------------------------
+# STREAM ENDPOINT
+# -------------------------------
 @app.get("/stream")
 async def get_stream_url(videoId: str):
+    """
+    Get streamable audio URL for a videoId
+    """
     try:
         if not videoId:
             raise HTTPException(status_code=400, detail="videoId is required")
@@ -79,10 +107,8 @@ async def get_stream_url(videoId: str):
             "format": "bestaudio/best",
             "quiet": True,
             "no_warnings": True,
-            "extractaudio": True,
-            "audioformat": "mp3",
             "noplaylist": True,
-            "cookiefile": COOKIES_PATH,  # IMPORTANT
+            "cookiefile": COOKIES_PATH,   # required for age/region locked content
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -91,7 +117,7 @@ async def get_stream_url(videoId: str):
                 download=False
             )
 
-            # best audio URL
+            # Best audio URL
             audio_url = None
 
             if "url" in info:
@@ -102,7 +128,7 @@ async def get_stream_url(videoId: str):
                     if f.get("acodec") != "none" and f.get("vcodec") == "none"
                 ]
                 if audio_formats:
-                    audio_formats.sort(key=lambda x: x.get("abr", 0), reverse=True)
+                    audio_formats.sort(key=lambda x: x.get("abr", 0) or 0, reverse=True)
                     audio_url = audio_formats[0].get("url")
 
             if not audio_url:
@@ -120,11 +146,17 @@ async def get_stream_url(videoId: str):
         raise HTTPException(status_code=500, detail=f"Stream URL extraction failed: {str(e)}")
 
 
+# -------------------------------
+# HEALTH CHECK
+# -------------------------------
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "service": "Aureum API"}
 
 
+# -------------------------------
+# DEV MODE
+# -------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
