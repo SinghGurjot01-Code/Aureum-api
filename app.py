@@ -11,6 +11,7 @@ import requests
 import hashlib
 import time
 from typing import Optional
+import urllib.parse
 
 app = FastAPI(title="Aureum Music API")
 
@@ -114,11 +115,18 @@ async def search(q: str, limit: int = 20):
                 elif len(parts) == 3:
                     duration_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
             
+            # Get the best thumbnail (highest resolution)
+            thumbnail = ""
+            if item.get('thumbnails'):
+                # Sort by width to get the highest resolution
+                thumbnails = sorted(item['thumbnails'], key=lambda x: x.get('width', 0), reverse=True)
+                thumbnail = thumbnails[0].get('url', '') if thumbnails else ""
+            
             formatted_results.append({
                 "videoId": item.get('videoId', ''),
                 "title": item.get('title', ''),
                 "artists": ", ".join(artists) if artists else "",
-                "thumbnail": item.get('thumbnails', [{}])[-1].get('url', '') if item.get('thumbnails') else "",
+                "thumbnail": thumbnail,
                 "duration": duration,
                 "duration_seconds": duration_seconds
             })
@@ -177,6 +185,38 @@ async def stream(videoId: str):
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stream extraction failed: {str(e)}")
+
+@app.get("/home")
+async def get_home():
+    """Get home page content like YouTube Music"""
+    try:
+        ytmusic = get_ytmusic()
+        home_data = ytmusic.get_home(limit=6)
+        
+        formatted_sections = []
+        for section in home_data:
+            if 'contents' in section:
+                items = []
+                for content in section['contents']:
+                    if 'title' in content:
+                        item = {
+                            'title': content.get('title', ''),
+                            'browseId': content.get('browseId', ''),
+                            'playlistId': content.get('playlistId', ''),
+                            'thumbnails': content.get('thumbnails', [])
+                        }
+                        items.append(item)
+                
+                if items:
+                    formatted_sections.append({
+                        'title': section.get('title', ''),
+                        'items': items[:6]  # Limit to 6 items per section
+                    })
+        
+        return JSONResponse(content=formatted_sections)
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Home data failed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
