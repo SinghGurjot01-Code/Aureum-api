@@ -1,11 +1,11 @@
 # app.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from ytmusicapi import YTMusic
 import yt_dlp
 import os
-import time, hashlib
+import time
+import hashlib
 
 app = FastAPI(title="Aureum Music API")
 
@@ -20,9 +20,9 @@ app.add_middleware(
 COOKIES_FILE = "/etc/secrets/cookies.txt"
 
 
-# -------------------------------
-# COOKIE PARSER (ALWAYS WORKS)
-# -------------------------------
+# =====================================================
+# COOKIE PARSER → YTMusic AUTH (SAPISIDHASH METHOD)
+# =====================================================
 def load_cookies_as_headers(cookie_file):
     if not os.path.exists(cookie_file):
         raise RuntimeError("cookies.txt not found")
@@ -46,7 +46,7 @@ def load_cookies_as_headers(cookie_file):
     )
 
     if not sapisid:
-        raise RuntimeError("No SAPISID cookie found")
+        raise RuntimeError("No valid SAPISID cookie found")
 
     origin = "https://music.youtube.com"
     timestamp = int(time.time())
@@ -62,16 +62,16 @@ def load_cookies_as_headers(cookie_file):
     return headers
 
 
-# -------------------------------
-# INIT YTMUSIC
-# -------------------------------
+# =====================================================
+# INITIALIZE YTMUSIC
+# =====================================================
 try:
     headers_raw = load_cookies_as_headers(COOKIES_FILE)
     ytmusic = YTMusic(headers_raw=headers_raw)
     print("YTMusic authenticated successfully")
 except Exception as e:
-    print("YTMusic authentication failed:", e)
-    ytmusic = YTMusic()  # fallback
+    print("YTMusic auth failed → Falling back:", e)
+    ytmusic = YTMusic()
 
 
 @app.get("/")
@@ -79,9 +79,9 @@ def root():
     return {"status": "online"}
 
 
-# -------------------------------
-# SEARCH
-# -------------------------------
+# =====================================================
+# SEARCH ENDPOINT
+# =====================================================
 @app.get("/search")
 async def search_music(q: str, limit: int = 20):
     try:
@@ -92,6 +92,7 @@ async def search_music(q: str, limit: int = 20):
 
         formatted = []
         for r in results:
+            # duration → seconds
             duration_sec = 0
             if r.get("duration"):
                 t = r["duration"].split(":")
@@ -104,7 +105,7 @@ async def search_music(q: str, limit: int = 20):
 
             formatted.append({
                 "videoId": r.get("videoId", ""),
-                "title": r.get("title", ""),
+                "title": r.get("title", "Unknown"),
                 "artists": ", ".join(artists),
                 "thumbnail": r.get("thumbnails", [{}])[-1].get("url", ""),
                 "duration": r.get("duration", "0:00"),
@@ -117,20 +118,24 @@ async def search_music(q: str, limit: int = 20):
         raise HTTPException(500, f"Search failed: {str(e)}")
 
 
-# -------------------------------
-# STREAM (FIXED + UPDATED)
-# -------------------------------
+# =====================================================
+# STREAM ENDPOINT — 2025 WORKING VERSION
+# =====================================================
 @app.get("/stream")
 async def stream_music(videoId: str):
     try:
         if not videoId:
             raise HTTPException(400, "videoId is required")
 
+        # The MOST powerful fallback chain
         ydl_opts = {
-            "format": "ba[ext=webm][acodec=opus]/ba/bestaudio/best",
+            "format": (
+                "ba[ext=webm][acodec=opus]/"
+                "ba/bestaudio/best/"
+                "bestvideo*+bestaudio/best"
+            ),
             "quiet": True,
             "no_warnings": True,
-            "extractaudio": False,
             "noplaylist": True,
             "cookiefile": COOKIES_FILE,
             "http_headers": {
@@ -138,8 +143,10 @@ async def stream_music(videoId: str):
                 "Accept-Language": "en-US,en;q=0.9",
             },
             "extractor_args": {
-                "youtube": {"player_client": ["web", "android"]}
-            },
+                "youtube": {
+                    "player_client": ["web", "android"]
+                }
+            }
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -148,17 +155,19 @@ async def stream_music(videoId: str):
                 download=False
             )
 
-        # Extract audio URL
+        # Extract direct audio url
         audio_url = None
 
         if "url" in info:
             audio_url = info["url"]
+
         else:
             audio_formats = [
                 f
                 for f in info.get("formats", [])
-                if f.get("acodec") != "none" and f.get("vcodec") == "none"
+                if f.get("acodec") != "none"
             ]
+
             if audio_formats:
                 audio_formats.sort(key=lambda x: x.get("abr", 0), reverse=True)
                 audio_url = audio_formats[0].get("url")
@@ -168,10 +177,10 @@ async def stream_music(videoId: str):
 
         return {
             "stream_url": audio_url,
-            "title": info.get("title"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-            "videoId": videoId,
+            "title": info.get("title", "Unknown"),
+            "duration": info.get("duration", 0),
+            "thumbnail": info.get("thumbnail", ""),
+            "videoId": videoId
         }
 
     except Exception as e:
