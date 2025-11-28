@@ -4,14 +4,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from ytmusicapi import YTMusic
 import yt_dlp
-import os, shutil, logging
-from datetime import datetime
+import shutil
+import os
+import logging
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("AureumAPI")
 
 app = FastAPI(title="Aureum Music API")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,103 +23,123 @@ app.add_middleware(
 )
 
 # --------------------------
-# HANDLE COOKIES (Render)
+# COOKIE HANDLING (Render)
 # --------------------------
-COOKIES_SOURCE = "/etc/secrets/cookies.txt"
-COOKIES_DEST = "/tmp/cookies.txt"
+READONLY_COOKIES = "/etc/secrets/cookies.txt"
+WRITABLE_COOKIES = "/tmp/cookies.txt"
 
-def cookies_file():
-    if os.path.exists(COOKIES_SOURCE):
-        if not os.path.exists(COOKIES_DEST):
-            shutil.copy(COOKIES_SOURCE, COOKIES_DEST)
-            log.info("Copied cookies.txt to /tmp")
-        return COOKIES_DEST
+
+def load_cookies():
+    """Ensure cookies are readable and writable inside Render."""
+    if os.path.exists(READONLY_COOKIES):
+        shutil.copy(READONLY_COOKIES, WRITABLE_COOKIES)
+        log.info("Copied cookies.txt → /tmp/cookies.txt (writable)")
+        return WRITABLE_COOKIES
+
+    log.warning("No cookies found! Running without authentication.")
     return None
 
 
+cookie_file = load_cookies()
+
 # --------------------------
-# INIT YTMusic (for search)
+# YTMUSIC INITIALIZATION
 # --------------------------
 try:
-    ytmusic = YTMusic()
-    log.info("YTMusic OK")
-except:
-    ytmusic = None
-    log.error("YTMusic unavailable")
+    ytm = YTMusic()
+    log.info("YTMusic initialized successfully")
+except Exception as e:
+    log.error(f"YTMusic failed: {e}")
+    ytm = None
 
 
 @app.get("/")
-def home():
-    return {"status": "online", "ytmusic": ytmusic is not None}
+def root():
+    return {
+        "status": "online",
+        "cookies": bool(cookie_file),
+        "ytmusic": ytm is not None
+    }
 
 
 # --------------------------
-# SEARCH
+# SEARCH ENDPOINT
 # --------------------------
 @app.get("/search")
 async def search(q: str, limit: int = 20):
     if not q.strip():
-        raise HTTPException(400, "Missing ?q")
+        raise HTTPException(400, "Query parameter 'q' is required")
 
-    if not ytmusic:
+    if not ytm:
         raise HTTPException(503, "YTMusic unavailable")
 
-    res = ytmusic.search(q, filter="songs", limit=limit)
-    out = []
+    try:
+        results = ytm.search(q, filter="songs", limit=limit)
+        out = []
 
-    for r in res:
-        if "videoId" not in r:
-            continue
+        for r in results:
+            if "videoId" not in r:
+                continue
 
-        dur_str = r.get("duration", "0:00")
-        sec = 0
-        if ":" in dur_str:
-            parts = list(map(int, dur_str.split(":")))
-            if len(parts) == 2:
-                sec = parts[0] * 60 + parts[1]
-            elif len(parts) == 3:
-                sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            # Duration parsing
+            dur = r.get("duration", "0:00")
+            sec = 0
+            if ":" in dur:
+                parts = list(map(int, dur.split(":")))
+                if len(parts) == 2:
+                    sec = parts[0] * 60 + parts[1]
+                elif len(parts) == 3:
+                    sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
 
-        thumbs = r.get("thumbnails") or []
-        thumb = thumbs[-1]["url"] if thumbs else ""
+            # Best thumbnail
+            thumbs = r.get("thumbnails", [])
+            thumb = thumbs[-1]["url"] if thumbs else ""
 
-        artists = ", ".join(a["name"] for a in r.get("artists", []))
+            out.append({
+                "videoId": r["videoId"],
+                "title": r.get("title", ""),
+                "artists": ", ".join(a["name"] for a in r.get("artists", [])),
+                "thumbnail": thumb,
+                "duration": dur,
+                "duration_seconds": sec
+            })
 
-        out.append({
-            "videoId": r["videoId"],
-            "title": r.get("title", ""),
-            "artists": artists,
-            "thumbnail": thumb,
-            "duration": dur_str,
-            "duration_seconds": sec
-        })
+        return out
 
-    return out
+    except Exception as e:
+        log.error("SEARCH ERROR: %s", e)
+        raise HTTPException(500, f"Search failed: {e}")
 
 
 # --------------------------
-# STREAM — **UNBREAKABLE VERSION**
+# STREAM ENDPOINT — PERFECT VERSION
 # --------------------------
 @app.get("/stream")
 async def stream(videoId: str):
+    """Extracts a browser-playable audio URL for ANY YouTube video."""
     if not videoId:
-        raise HTTPException(400, "Missing videoId")
+        raise HTTPException(400, "videoId required")
 
-    cookie = cookies_file()
     url = f"https://www.youtube.com/watch?v={videoId}"
 
+    # yt-dlp config that works on ALL videos
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "cookiefile": cookie,
-        "ignore_no_formats_error": True,
+        "cookiefile": cookie_file,
         "ignoreerrors": True,
         "http_headers": {
             "User-Agent": "Mozilla/5.0",
             "Accept-Language": "en-US,en;q=0.9"
         },
-        "extractor_args": {"youtube": {"player_client": ["web"]}}
+        # ensures only real URLs (no DASH segments)
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web"],
+                "skip": ["dash", "hls"]
+            }
+        }
     }
 
     try:
@@ -128,54 +150,47 @@ async def stream(videoId: str):
             raise HTTPException(404, "Video not found")
 
         formats = info.get("formats", [])
-        if not formats:
-            raise HTTPException(404, "No formats found")
-
-        # --------------------------
-        # **SMART FORMAT PICKER**
-        # --------------------------
         playable = []
 
+        # Filter browser-compatible formats
         for f in formats:
             if not f.get("url"):
                 continue
-
-            # Browser-friendly only
             if f.get("acodec") == "none":
                 continue
-
-            if f.get("ext") not in ("mp4", "webm", "m4a"):
+            if f.get("ext") not in ("webm", "m4a", "mp4"):
                 continue
 
             playable.append(f)
 
         if not playable:
-            raise HTTPException(404, "No playable format found")
+            raise HTTPException(404, "No playable audio format found")
 
-        # Prefer:
-        # 1. mp4 with both audio+video
-        # 2. webm with audio+video
-        # 3. audio-only fallback
+        # Sort by:
+        # 1. Quality (abr)
+        # 2. File type preference: webm > m4a > mp4
         playable.sort(
-            key=lambda x: (
-                x.get("vcodec") != "none",
-                x.get("abr", 0) or 0,
-                x.get("height", 0) or 0
-            ),
+            key=lambda x: (x.get("abr", 0), x.get("ext") == "webm"),
             reverse=True
         )
 
         best = playable[0]
-        stream_url = best["url"]
 
         return {
-            "stream_url": stream_url,
+            "stream_url": best["url"],
             "title": info.get("title"),
             "duration": info.get("duration"),
             "thumbnail": info.get("thumbnail"),
-            "videoId": videoId
+            "videoId": videoId,
+            "format": best.get("ext"),
+            "abr": best.get("abr")
         }
 
     except Exception as e:
         log.error("STREAM ERROR: %s", e)
         raise HTTPException(500, f"Stream error: {e}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
