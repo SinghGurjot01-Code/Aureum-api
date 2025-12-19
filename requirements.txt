@@ -3,6 +3,5 @@ uvicorn
 ytmusicapi==1.11.2
 yt-dlp
 aiohttp
-requests
 python-multipart
 
