@@ -1,5 +1,6 @@
 # core/ytmusic_client.py
 import os
+import json
 import logging
 from typing import List, Dict, Any
 from ytmusicapi import YTMusic
@@ -9,22 +10,46 @@ log = logging.getLogger(__name__)
 ytm = None
 
 def init_ytmusic():
-    """Initialize YTMusic - Render only"""
+    """Initialize YTMusic - Handle any cookie format"""
     global ytm
     
     # Try cookies from Render secrets
     cookie_path = "/etc/secrets/cookies.txt"
-    temp_path = "/tmp/cookies.txt"
     
     if os.path.exists(cookie_path):
         try:
-            # Copy to temp location
-            with open(cookie_path, 'r') as src, open(temp_path, 'w') as dst:
-                dst.write(src.read())
+            # Read cookie file
+            with open(cookie_path, 'r') as f:
+                content = f.read().strip()
             
-            ytm = YTMusic(auth=temp_path)
-            log.info("YTMusic authenticated with cookies")
-            return ytm
+            # Check if it's JSON
+            if content and content.startswith('{'):
+                try:
+                    # Try to parse as JSON
+                    json.loads(content)
+                    # Valid JSON - write to temp file
+                    temp_path = "/tmp/cookies.txt"
+                    with open(temp_path, 'w') as f:
+                        f.write(content)
+                    
+                    ytm = YTMusic(auth=temp_path)
+                    log.info("YTMusic authenticated with JSON cookies")
+                    return ytm
+                except json.JSONDecodeError:
+                    log.warning("Cookie file is not valid JSON")
+            
+            # If not JSON, check if it's raw cookie string
+            if '=' in content and ';' in content:
+                # Looks like raw cookie string
+                cookie_json = json.dumps({"cookie": content})
+                temp_path = "/tmp/cookies.txt"
+                with open(temp_path, 'w') as f:
+                    f.write(cookie_json)
+                
+                ytm = YTMusic(auth=temp_path)
+                log.info("YTMusic authenticated with raw cookie string")
+                return ytm
+            
         except Exception as e:
             log.warning(f"Cookie auth failed: {e}")
     
@@ -40,6 +65,7 @@ def init_ytmusic():
 def search_songs(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     """Search songs - original behavior preserved"""
     if not ytm:
+        log.warning("YTMusic not available")
         return []
     
     try:
