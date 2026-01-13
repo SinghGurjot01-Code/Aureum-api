@@ -25,19 +25,21 @@ async def lifespan(app: FastAPI):
     try:
         from core.ytmusic_client import init_ytmusic
         ytm = init_ytmusic()
-        log.info("YTMusic initialized")
+        if ytm:
+            log.info("YTMusic initialized")
+        else:
+            log.warning("YTMusic failed to initialize")
     except Exception as e:
-        log.error(f"YTMusic init failed: {e}")
+        log.error(f"YTMusic init error: {e}")
         ytm = None
     
-    # Initialize Redis
+    # Initialize Redis (always works - uses dummy if needed)
     try:
         from redis.client import get_redis_client
         redis_client = get_redis_client()
-        if redis_client:
-            log.info("Redis initialized")
+        log.info("Redis client ready")
     except Exception as e:
-        log.error(f"Redis init failed: {e}")
+        log.error(f"Redis init error: {e}")
         redis_client = None
     
     yield
