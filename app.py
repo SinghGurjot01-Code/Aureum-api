@@ -10,16 +10,16 @@ import uuid
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("AureumAPI")
 
-# Global instances
+# Initialize at startup
 ytm = None
 redis_client = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global ytm, redis_client
+    
     # Startup
     log.info("Starting Aureum Music API")
-    
-    global ytm, redis_client
     
     # Initialize YTMusic
     try:
@@ -27,7 +27,7 @@ async def lifespan(app: FastAPI):
         ytm = init_ytmusic()
         log.info("YTMusic initialized")
     except Exception as e:
-        log.error(f"Failed to initialize YTMusic: {e}")
+        log.error(f"YTMusic init failed: {e}")
         ytm = None
     
     # Initialize Redis
@@ -37,7 +37,7 @@ async def lifespan(app: FastAPI):
         if redis_client:
             log.info("Redis initialized")
     except Exception as e:
-        log.error(f"Failed to initialize Redis: {e}")
+        log.error(f"Redis init failed: {e}")
         redis_client = None
     
     yield
@@ -65,18 +65,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Root endpoint
+# Root
 @app.get("/")
 def root():
     return {
         "status": "online",
         "version": "2.0.0",
-        "message": "Aureum Music API",
+        "service": "Aureum Music API",
         "ytmusic": ytm is not None,
         "redis": redis_client is not None
     }
 
-# Health check
+# Health
 @app.get("/health")
 def health():
     return {
@@ -88,7 +88,6 @@ def health():
 # Original search endpoint (preserved)
 @app.get("/search")
 async def search(q: str, limit: int = 20):
-    """Search for songs"""
     if not q or not q.strip():
         raise HTTPException(400, "Missing search query")
     
@@ -105,20 +104,16 @@ async def search(q: str, limit: int = 20):
 # Session endpoints
 @app.post("/session/start")
 async def session_start(user_id: str = None):
-    """Start a session"""
     session_id = str(uuid.uuid4())
     
     if redis_client:
         try:
-            data = {
-                "id": session_id,
-                "user_id": user_id,
-                "created": datetime.utcnow().isoformat()
-            }
-            await redis_client.set(f"session:{session_id}", str(data), ex=86400)
+            from session.store import SessionStore
+            store = SessionStore()
+            await store.start_session(session_id, user_id)
             return {"session_id": session_id, "status": "started"}
         except Exception as e:
-            log.error(f"Failed to save session: {e}")
+            log.error(f"Session start failed: {e}")
     
     return {"session_id": session_id, "status": "created"}
 
@@ -126,76 +121,55 @@ async def session_start(user_id: str = None):
 async def session_event(
     session_id: str,
     event_type: str,
-    video_id: str = None
+    video_id: str = None,
+    user_id: str = None
 ):
-    """Record an event"""
     if redis_client:
         try:
-            data = {
-                "session_id": session_id,
-                "event_type": event_type,
-                "video_id": video_id,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            key = f"event:{session_id}:{datetime.utcnow().timestamp()}"
-            await redis_client.set(key, str(data), ex=604800)
+            from session.store import SessionStore
+            store = SessionStore()
+            await store.record_event(session_id, event_type, video_id, user_id)
             return {"status": "recorded"}
         except Exception as e:
-            log.error(f"Failed to record event: {e}")
+            log.error(f"Session event failed: {e}")
     
     return {"status": "received"}
 
-# Recommendations endpoint
+# Recommendations
 @app.post("/recommend/contextual")
 async def get_recommendations(
     current_video_id: str = None,
+    user_id: str = None,
     limit: int = 20
 ):
-    """Get recommendations"""
     if not ytm:
         return {"tracks": [], "reason": "service_unavailable"}
     
     try:
+        from recommend.engine import RecommendationEngine
+        engine = RecommendationEngine()
+        return await engine.get_recommendations(current_video_id, user_id, limit)
+    except Exception as e:
+        log.error(f"Recommendations failed: {e}")
         from core.ytmusic_client import search_songs
-        
-        # Simple recommendation logic
-        if current_video_id:
-            # In a real app, you'd fetch the track details first
-            results = search_songs("music", limit=limit)
-        else:
-            # Popular music as fallback
-            results = search_songs("popular", limit=limit)
-        
+        results = search_songs("popular", limit=limit)
         return {
             "tracks": results,
             "count": len(results),
             "generated_at": datetime.utcnow().isoformat()
         }
-    except Exception as e:
-        log.error(f"Recommendations failed: {e}")
-        return {"tracks": []}
 
-# Cache manifest endpoint
+# Cache manifest
 @app.post("/cache/manifest")
-async def get_cache_manifest():
-    """Get cache suggestions"""
-    if not ytm:
-        return {"must_cache": [], "likely_next": []}
-    
+async def get_cache_manifest(user_id: str = None):
     try:
-        from core.ytmusic_client import search_songs
-        
-        # Get popular tracks
-        popular = search_songs("popular music", limit=10)
-        
-        # Get trending tracks
-        trending = search_songs("trending", limit=10)
-        
-        return {
-            "must_cache": popular[:5],
-            "likely_next": trending[:10],
-            "expires_at": int(datetime.utcnow().timestamp()) + 86400
-        }
+        from cache.manifest import CacheManifestGenerator
+        generator = CacheManifestGenerator()
+        return await generator.generate(user_id)
     except Exception as e:
         log.error(f"Cache manifest failed: {e}")
-        return {"must_cache": [], "likely_next": []}
+        return {
+            "must_cache": [],
+            "likely_next": [],
+            "expires_at": int(datetime.utcnow().timestamp()) + 3600
+        }
