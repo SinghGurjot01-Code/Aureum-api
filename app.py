@@ -5,23 +5,49 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-# Import modules
-from core import config
-from core.ytmusic_client import init_ytmusic, search_songs
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("AureumAPI")
 
-# Try to import Redis client, but don't crash if it fails
+# Import modules with graceful fallbacks
 try:
+    from core import config
+    CORE_AVAILABLE = True
+except ImportError as e:
+    log.warning(f"Core import failed: {e}")
+    CORE_AVAILABLE = False
+
+try:
+    from core.ytmusic_client import init_ytmusic, search_songs
+    YTMUSIC_AVAILABLE = True
+except ImportError as e:
+    log.warning(f"YTMusic import failed: {e}")
+    YTMUSIC_AVAILABLE = False
+
+# Try Redis imports with proper fallback
+REDIS_AVAILABLE = False
+try:
+    # First try the real Redis client
     from redis.client import get_redis_client
     REDIS_AVAILABLE = True
-except ImportError as e:
-    logging.warning(f"Redis import failed: {e}. Running without Redis.")
-    REDIS_AVAILABLE = False
+    log.info("Using real Redis client")
+except ImportError:
+    try:
+        # Fallback to simple client
+        from redis.simple_client import get_simple_redis_client as get_redis_client
+        REDIS_AVAILABLE = True
+        log.info("Using simple Redis fallback client")
+    except ImportError as e:
+        log.warning(f"All Redis imports failed: {e}. Running without Redis.")
+        # Create a dummy function
+        def get_redis_client():
+            return None
 
+# Try other imports
 try:
     from session.store import SessionStore
     SESSION_AVAILABLE = True
 except ImportError as e:
-    logging.warning(f"Session import failed: {e}. Running without session tracking.")
+    log.warning(f"Session import failed: {e}")
     SESSION_AVAILABLE = False
 
 try:
@@ -29,7 +55,7 @@ try:
     from cache.manifest import CacheManifestGenerator
     RECOMMENDATION_AVAILABLE = True
 except ImportError as e:
-    logging.warning(f"Recommendation import failed: {e}. Running without recommendations.")
+    log.warning(f"Recommendation import failed: {e}")
     RECOMMENDATION_AVAILABLE = False
 
 try:
@@ -40,11 +66,8 @@ try:
     )
     MODELS_AVAILABLE = True
 except ImportError as e:
-    logging.warning(f"Models import failed: {e}")
+    log.warning(f"Models import failed: {e}")
     MODELS_AVAILABLE = False
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("AureumAPI")
 
 # Lifespan context manager
 @asynccontextmanager
@@ -53,9 +76,12 @@ async def lifespan(app: FastAPI):
     log.info("Starting Aureum Music API")
     
     # Initialize YTMusic
-    ytm = init_ytmusic()
-    if not ytm:
-        log.warning("YTMusic initialization failed")
+    if YTMUSIC_AVAILABLE:
+        ytm = init_ytmusic()
+        if not ytm:
+            log.warning("YTMusic initialization failed")
+    else:
+        log.warning("YTMusic not available")
     
     # Initialize Redis if available
     if REDIS_AVAILABLE:
@@ -98,20 +124,24 @@ def root():
         "version": "2.0.0",
         "message": "Aureum Music Intelligence Engine",
         "features": {
-            "search": True,
+            "search": YTMUSIC_AVAILABLE,
             "session_tracking": SESSION_AVAILABLE,
             "recommendations": RECOMMENDATION_AVAILABLE,
-            "redis_available": REDIS_AVAILABLE
+            "redis_available": REDIS_AVAILABLE,
+            "models_available": MODELS_AVAILABLE
         }
     }
 
 @app.get("/health")
 def health():
-    from core.ytmusic_client import ytm
+    ytm_ready = False
+    if YTMUSIC_AVAILABLE:
+        from core.ytmusic_client import ytm
+        ytm_ready = ytm is not None
     
     return {
-        "status": "healthy",
-        "ytmusic_ready": ytm is not None,
+        "status": "healthy" if YTMUSIC_AVAILABLE else "degraded",
+        "ytmusic_ready": ytm_ready,
         "redis_ready": REDIS_AVAILABLE,
         "version": "2.0.0",
         "features": {
@@ -128,6 +158,9 @@ async def search(q: str, limit: int = 20):
     """Original search endpoint - fully backward compatible"""
     if not q.strip():
         raise HTTPException(400, "Missing ?q")
+    
+    if not YTMUSIC_AVAILABLE:
+        raise HTTPException(503, "Search service unavailable")
     
     try:
         results = search_songs(q, limit)
