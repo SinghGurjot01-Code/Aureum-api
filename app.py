@@ -6,15 +6,14 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import uuid
 
-# Set up logging first
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("AureumAPI")
 
-# Initialize with defaults
+# Global instances
 ytm = None
 redis_client = None
 
-# Lifespan context manager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -26,12 +25,9 @@ async def lifespan(app: FastAPI):
     try:
         from core.ytmusic_client import init_ytmusic
         ytm = init_ytmusic()
-        if ytm:
-            log.info("YTMusic initialized")
-        else:
-            log.warning("YTMusic initialization failed")
+        log.info("YTMusic initialized")
     except Exception as e:
-        log.error(f"YTMusic import failed: {e}")
+        log.error(f"Failed to initialize YTMusic: {e}")
         ytm = None
     
     # Initialize Redis
@@ -39,17 +35,15 @@ async def lifespan(app: FastAPI):
         from redis.client import get_redis_client
         redis_client = get_redis_client()
         if redis_client:
-            log.info("Redis client initialized")
-        else:
-            log.warning("Redis client initialization failed")
+            log.info("Redis initialized")
     except Exception as e:
-        log.error(f"Redis import failed: {e}")
+        log.error(f"Failed to initialize Redis: {e}")
         redis_client = None
     
     yield
     
     # Shutdown
-    log.info("Shutting down Aureum Music API")
+    log.info("Shutting down")
     if redis_client:
         try:
             await redis_client.close()
@@ -58,14 +52,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Aureum Music API",
-    description="Backend for Aureum Music",
     version="2.0.0",
     lifespan=lifespan
 )
 
-# ---------------------------------------------------
 # CORS
-# ---------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,180 +65,137 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------
-# HEALTH & ROOT
-# ---------------------------------------------------
+# Root endpoint
 @app.get("/")
 def root():
     return {
         "status": "online",
         "version": "2.0.0",
         "message": "Aureum Music API",
-        "endpoints": {
-            "/search": "GET - Search for songs",
-            "/session/start": "POST - Start session",
-            "/session/event": "POST - Record event",
-            "/recommend/contextual": "POST - Get recommendations",
-            "/cache/manifest": "POST - Get cache manifest"
-        }
+        "ytmusic": ytm is not None,
+        "redis": redis_client is not None
     }
 
+# Health check
 @app.get("/health")
 def health():
     return {
-        "status": "healthy",
-        "ytmusic_ready": ytm is not None,
-        "redis_ready": redis_client is not None,
-        "version": "2.0.0"
+        "status": "healthy" if ytm else "degraded",
+        "ytmusic": ytm is not None,
+        "redis": redis_client is not None
     }
 
-# ---------------------------------------------------
-# SEARCH ENDPOINT (Original - Preserved)
-# ---------------------------------------------------
+# Original search endpoint (preserved)
 @app.get("/search")
 async def search(q: str, limit: int = 20):
-    """Original search endpoint - fully backward compatible"""
-    if not q.strip():
-        raise HTTPException(400, "Missing ?q")
+    """Search for songs"""
+    if not q or not q.strip():
+        raise HTTPException(400, "Missing search query")
     
-    if ytm is None:
-        raise HTTPException(503, "Search service unavailable")
+    if not ytm:
+        raise HTTPException(503, "Service unavailable")
     
     try:
         from core.ytmusic_client import search_songs
-        results = search_songs(q, limit)
-        return results
+        return search_songs(q, limit)
     except Exception as e:
-        log.error(f"SEARCH ERROR: {e}")
+        log.error(f"Search failed: {e}")
         return []
 
-# ---------------------------------------------------
-# SESSION TRACKING ENDPOINTS
-# ---------------------------------------------------
+# Session endpoints
 @app.post("/session/start")
-async def session_start(user_id: str = None, device_info: str = None, location: str = None):
-    """Start a new listening session"""
+async def session_start(user_id: str = None):
+    """Start a session"""
     session_id = str(uuid.uuid4())
     
     if redis_client:
         try:
-            session_data = {
-                "session_id": session_id,
+            data = {
+                "id": session_id,
                 "user_id": user_id,
-                "device_info": device_info,
-                "location": location,
-                "started_at": datetime.utcnow().isoformat()
+                "created": datetime.utcnow().isoformat()
             }
-            await redis_client.set(f"session:{session_id}", str(session_data), ex=86400)
+            await redis_client.set(f"session:{session_id}", str(data), ex=86400)
             return {"session_id": session_id, "status": "started"}
         except Exception as e:
-            log.error(f"Session start error: {e}")
+            log.error(f"Failed to save session: {e}")
     
-    return {"session_id": session_id, "status": "started_fallback"}
+    return {"session_id": session_id, "status": "created"}
 
 @app.post("/session/event")
 async def session_event(
     session_id: str,
     event_type: str,
-    video_id: str = None,
-    user_id: str = None
+    video_id: str = None
 ):
-    """Record a session event"""
+    """Record an event"""
     if redis_client:
         try:
-            event_data = {
+            data = {
                 "session_id": session_id,
                 "event_type": event_type,
                 "video_id": video_id,
-                "user_id": user_id,
                 "timestamp": datetime.utcnow().isoformat()
             }
-            event_key = f"event:{session_id}:{datetime.utcnow().timestamp()}"
-            await redis_client.set(event_key, str(event_data), ex=604800)
-            
-            # Also update recent activity
-            if user_id and video_id:
-                activity_key = f"activity:{user_id}"
-                await redis_client.lpush(activity_key, str({
-                    "video_id": video_id,
-                    "event_type": event_type,
-                    "timestamp": datetime.utcnow().isoformat()
-                }))
-                await redis_client.ltrim(activity_key, 0, 49)  # Keep last 50
-            
+            key = f"event:{session_id}:{datetime.utcnow().timestamp()}"
+            await redis_client.set(key, str(data), ex=604800)
             return {"status": "recorded"}
         except Exception as e:
-            log.error(f"Session event error: {e}")
+            log.error(f"Failed to record event: {e}")
     
-    return {"status": "recorded_fallback"}
+    return {"status": "received"}
 
-# ---------------------------------------------------
-# CONTEXT-AWARE RECOMMENDATIONS (Simplified)
-# ---------------------------------------------------
+# Recommendations endpoint
 @app.post("/recommend/contextual")
-async def contextual_recommendations(
+async def get_recommendations(
     current_video_id: str = None,
-    user_id: str = None,
     limit: int = 20
 ):
-    """Get context-aware recommendations"""
+    """Get recommendations"""
+    if not ytm:
+        return {"tracks": [], "reason": "service_unavailable"}
     
-    # Fallback recommendations based on current video
-    recommendations = []
-    
-    if current_video_id and ytm:
-        try:
-            # Get artist from current video (simplified)
-            from core.ytmusic_client import search_songs
-            # Search for similar
+    try:
+        from core.ytmusic_client import search_songs
+        
+        # Simple recommendation logic
+        if current_video_id:
+            # In a real app, you'd fetch the track details first
             results = search_songs("music", limit=limit)
-            for i, track in enumerate(results):
-                label = "Recommended"
-                if i == 0:
-                    label = "Popular now"
-                elif i < 3:
-                    label = "Trending"
-                
-                recommendations.append({
-                    **track,
-                    "label": label,
-                    "score": 1.0 - (i * 0.05)
-                })
-        except Exception as e:
-            log.error(f"Recommendation error: {e}")
-    
-    return {
-        "tracks": recommendations,
-        "labels": [t.get("label", "") for t in recommendations if t.get("label")],
-        "context": {"source": "fallback"},
-        "generated_at": datetime.utcnow().isoformat()
-    }
+        else:
+            # Popular music as fallback
+            results = search_songs("popular", limit=limit)
+        
+        return {
+            "tracks": results,
+            "count": len(results),
+            "generated_at": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        log.error(f"Recommendations failed: {e}")
+        return {"tracks": []}
 
-# ---------------------------------------------------
-# OFFLINE CACHE PREDICTION (Simplified)
-# ---------------------------------------------------
+# Cache manifest endpoint
 @app.post("/cache/manifest")
-async def cache_manifest(user_id: str = None):
-    """Generate cache prediction"""
+async def get_cache_manifest():
+    """Get cache suggestions"""
+    if not ytm:
+        return {"must_cache": [], "likely_next": []}
     
-    must_cache = []
-    likely_next = []
-    
-    if ytm:
-        try:
-            from core.ytmusic_client import search_songs
-            # Get popular tracks
-            popular = search_songs("popular", limit=5)
-            must_cache = popular
-            
-            # Get trending tracks
-            trending = search_songs("trending", limit=10)
-            likely_next = trending
-        except Exception as e:
-            log.error(f"Cache manifest error: {e}")
-    
-    return {
-        "must_cache": must_cache[:5],
-        "likely_next": likely_next[:10],
-        "expires_at": int(datetime.utcnow().timestamp()) + 86400  # 24 hours
-    }
+    try:
+        from core.ytmusic_client import search_songs
+        
+        # Get popular tracks
+        popular = search_songs("popular music", limit=10)
+        
+        # Get trending tracks
+        trending = search_songs("trending", limit=10)
+        
+        return {
+            "must_cache": popular[:5],
+            "likely_next": trending[:10],
+            "expires_at": int(datetime.utcnow().timestamp()) + 86400
+        }
+    except Exception as e:
+        log.error(f"Cache manifest failed: {e}")
+        return {"must_cache": [], "likely_next": []}
