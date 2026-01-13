@@ -11,9 +11,64 @@ log = logging.getLogger(__name__)
 # Global YTMusic instance
 ytm = None
 
+def netscape_to_json(netscape_content: str) -> Optional[str]:
+    """
+    Convert Netscape format cookies to ytmusicapi JSON format
+    Netscape format:
+    # Netscape HTTP Cookie File
+    .youtube.com	TRUE	/	TRUE	1730000000	CONSENT	YES+
+    """
+    try:
+        cookies = []
+        lines = netscape_content.strip().split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            # Skip empty lines and comments
+            if not line or line.startswith('#'):
+                continue
+            
+            parts = line.split('\t')
+            if len(parts) >= 7:
+                domain = parts[0].strip()
+                # Handle subdomain flag
+                if domain.startswith('.'):
+                    host_only = False
+                    domain = domain[1:]  # Remove leading dot
+                else:
+                    host_only = True
+                
+                path = parts[2].strip()
+                secure = parts[3].strip().lower() == 'true'
+                expiration = float(parts[4].strip()) if parts[4].strip() else None
+                name = parts[5].strip()
+                value = parts[6].strip()
+                
+                cookie_obj = {
+                    "domain": domain,
+                    "expirationDate": expiration,
+                    "hostOnly": host_only,
+                    "httpOnly": False,  # Can't determine from Netscape format
+                    "name": name,
+                    "path": path,
+                    "sameSite": "no_restriction",
+                    "secure": secure,
+                    "session": expiration is None,
+                    "storeId": "0",
+                    "value": value
+                }
+                cookies.append(cookie_obj)
+        
+        if cookies:
+            return json.dumps(cookies)
+        return None
+    except Exception as e:
+        log.error(f"Failed to convert Netscape cookies: {e}")
+        return None
+
 def load_cookies() -> Optional[str]:
     """
-    Cookie loading logic (improved with better error handling)
+    Cookie loading logic with Netscape format support
     Checks in this order:
     1. Vercel env (YT_COOKIES)
     2. Render path (/etc/secrets)
@@ -23,71 +78,94 @@ def load_cookies() -> Optional[str]:
     
     writable_path = settings.cookies_writable_path
     
-    # Helper function to validate cookie file
-    def validate_cookie_file(path: str) -> bool:
-        """Check if cookie file contains valid JSON"""
+    def validate_and_prepare_cookie_file(source_path: str, target_path: str) -> bool:
+        """Validate cookie file and convert if needed"""
         try:
-            if not os.path.exists(path):
+            if not os.path.exists(source_path):
                 return False
-            with open(path, 'r') as f:
+            
+            with open(source_path, 'r') as f:
                 content = f.read().strip()
-                if not content:
-                    log.warning(f"Cookie file {path} is empty")
-                    return False
-                # Try to parse as JSON
+            
+            if not content:
+                log.warning(f"Cookie file {source_path} is empty")
+                return False
+            
+            # Try to parse as JSON first
+            try:
                 json.loads(content)
+                # Valid JSON - just copy it
+                shutil.copy(source_path, target_path)
+                log.info(f"Copied valid JSON cookies from {source_path}")
                 return True
-        except json.JSONDecodeError as e:
-            log.warning(f"Invalid JSON in cookie file {path}: {e}")
-            return False
+            except json.JSONDecodeError:
+                # Not JSON, try Netscape format
+                log.info(f"Cookie file is not JSON, trying Netscape format")
+                
+                # Check if it looks like Netscape format
+                if content.startswith('# Netscape HTTP Cookie File') or '\t' in content:
+                    json_content = netscape_to_json(content)
+                    if json_content:
+                        with open(target_path, 'w') as f:
+                            f.write(json_content)
+                        log.info(f"Converted Netscape cookies from {source_path} to JSON")
+                        return True
+                    else:
+                        log.warning(f"Failed to convert Netscape cookies from {source_path}")
+                        return False
+                else:
+                    log.warning(f"Cookie file {source_path} is neither JSON nor Netscape format")
+                    return False
+                    
         except Exception as e:
-            log.warning(f"Error reading cookie file {path}: {e}")
+            log.error(f"Error processing cookie file {source_path}: {e}")
             return False
     
     # CASE 1 — Vercel environment variable
     cookies_env = os.getenv(settings.cookies_env_var)
     if cookies_env:
         try:
-            # Validate the JSON before writing
-            json.loads(cookies_env)  # Will raise JSONDecodeError if invalid
+            # First try as JSON
+            json.loads(cookies_env)
             with open(writable_path, "w") as f:
                 f.write(cookies_env)
             log.info("Loaded cookies from ENV → /tmp/cookies.txt")
             return writable_path
-        except json.JSONDecodeError as e:
-            log.error(f"Invalid JSON in YT_COOKIES env var: {e}")
+        except json.JSONDecodeError:
+            # Try as Netscape format
+            json_content = netscape_to_json(cookies_env)
+            if json_content:
+                with open(writable_path, "w") as f:
+                    f.write(json_content)
+                log.info("Converted Netscape cookies from ENV → /tmp/cookies.txt")
+                return writable_path
+            else:
+                log.error("Invalid cookies in YT_COOKIES env var (neither JSON nor Netscape)")
         except Exception as e:
             log.error(f"Failed writing ENV cookies: {e}")
     
     # CASE 2 — Render read-only secret
     if os.path.exists(settings.cookies_readonly_path):
-        try:
-            # First check if it's valid
-            if validate_cookie_file(settings.cookies_readonly_path):
-                shutil.copy(settings.cookies_readonly_path, writable_path)
-                log.info("Copied /etc/secrets/cookies.txt → /tmp/cookies.txt")
-                return writable_path
-            else:
-                log.warning("Cookie file in /etc/secrets is invalid, skipping")
-        except Exception as e:
-            log.error(f"Failed copying cookies: {e}")
+        if validate_and_prepare_cookie_file(settings.cookies_readonly_path, writable_path):
+            return writable_path
+        else:
+            log.warning("Cookie file in /etc/secrets is invalid, skipping")
     
     # CASE 3 — Already exists and is valid
-    if os.path.exists(writable_path) and validate_cookie_file(writable_path):
-        log.info("Using existing valid /tmp/cookies.txt")
-        return writable_path
-    
-    # FAILURE - log what we found
-    log.warning("NO VALID COOKIES FOUND")
-    if os.path.exists(settings.cookies_readonly_path):
-        # Log first 100 chars of invalid cookie file for debugging
+    if os.path.exists(writable_path):
         try:
-            with open(settings.cookies_readonly_path, 'r') as f:
-                content = f.read(100)
-                log.warning(f"Cookie file content (first 100 chars): {content}")
+            with open(writable_path, 'r') as f:
+                content = f.read().strip()
+            if content:
+                # Quick validation
+                json.loads(content)
+                log.info("Using existing valid /tmp/cookies.txt")
+                return writable_path
         except:
             pass
     
+    # FAILURE
+    log.warning("NO VALID COOKIES FOUND - using unauthenticated mode")
     return None
 
 def init_ytmusic() -> Optional[YTMusic]:
@@ -125,7 +203,6 @@ def init_ytmusic() -> Optional[YTMusic]:
 def search_songs(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     """
     Search songs (preserved behavior)
-    Enhanced with fuzzy matching and fallback expansion
     """
     if not ytm:
         log.warning("YTMusic not initialized - returning empty results")
