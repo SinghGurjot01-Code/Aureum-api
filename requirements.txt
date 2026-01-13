@@ -3,6 +3,3 @@ uvicorn
 ytmusicapi
 redis==4.6.0
 pydantic
-pydantic-settings
-python-multipart
-rapidfuzz
