@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 ytmusicapi
-redis
+redis==4.6.0
 pydantic
 pydantic-settings
 python-multipart
