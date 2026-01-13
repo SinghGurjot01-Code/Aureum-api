@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 ytmusicapi
-redis==4.6.0
+redis==5.0.4
 pydantic
