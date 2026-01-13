@@ -1,80 +1,45 @@
 # core/ytmusic_client.py
 import os
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from ytmusicapi import YTMusic
 
 log = logging.getLogger(__name__)
 
-# Global YTMusic instance
 ytm = None
 
-def load_cookies() -> Optional[str]:
-    """
-    Load cookies from Render secrets
-    Only checks /etc/secrets/cookies.txt
-    """
-    from core.config import settings
-    
-    source_path = settings.cookies_path
-    temp_path = settings.cookies_temp_path
-    
-    if not os.path.exists(source_path):
-        log.warning(f"No cookie file found at {source_path}")
-        return None
-    
-    try:
-        # Read the cookie file
-        with open(source_path, 'r') as f:
-            content = f.read().strip()
-        
-        if not content:
-            log.warning("Cookie file is empty")
-            return None
-        
-        # Copy to temp location (ytmusicapi needs writable location)
-        with open(temp_path, 'w') as f:
-            f.write(content)
-        
-        log.info(f"Loaded cookies from {source_path}")
-        return temp_path
-        
-    except Exception as e:
-        log.error(f"Failed to load cookies: {e}")
-        return None
-
-def init_ytmusic() -> Optional[YTMusic]:
-    """Initialize YTMusic"""
+def init_ytmusic():
+    """Initialize YTMusic - Render only"""
     global ytm
     
-    # Try with cookies first
-    cookie_path = load_cookies()
-    if cookie_path:
+    # Try cookies from Render secrets
+    cookie_path = "/etc/secrets/cookies.txt"
+    temp_path = "/tmp/cookies.txt"
+    
+    if os.path.exists(cookie_path):
         try:
-            ytm_instance = YTMusic(auth=cookie_path)
+            # Copy to temp location
+            with open(cookie_path, 'r') as src, open(temp_path, 'w') as dst:
+                dst.write(src.read())
+            
+            ytm = YTMusic(auth=temp_path)
             log.info("YTMusic authenticated with cookies")
-            ytm = ytm_instance
             return ytm
         except Exception as e:
             log.warning(f"Cookie auth failed: {e}")
-            # Continue to fallback
     
-    # Fallback: unauthenticated
+    # Fallback to unauthenticated
     try:
-        ytm_instance = YTMusic()
+        ytm = YTMusic()
         log.info("YTMusic initialized without cookies")
-        ytm = ytm_instance
         return ytm
     except Exception as e:
-        log.error(f"YTMusic initialization failed: {e}")
+        log.error(f"YTMusic failed: {e}")
         return None
 
 def search_songs(query: str, limit: int = 20) -> List[Dict[str, Any]]:
-    """
-    Search songs - original preserved behavior
-    """
+    """Search songs - original behavior preserved"""
     if not ytm:
-        log.warning("YTMusic not initialized")
         return []
     
     try:
@@ -85,7 +50,6 @@ def search_songs(query: str, limit: int = 20) -> List[Dict[str, Any]]:
             if "videoId" not in r:
                 continue
 
-            # Parse duration
             dur = r.get("duration", "0:00")
             sec = 0
             if ":" in dur:
@@ -95,7 +59,7 @@ def search_songs(query: str, limit: int = 20) -> List[Dict[str, Any]]:
                         sec = parts[0] * 60 + parts[1]
                     elif len(parts) == 3:
                         sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
-                except (ValueError, TypeError):
+                except:
                     sec = 0
 
             thumbs = r.get("thumbnails", [])
