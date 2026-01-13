@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+ytmusicapi
+redis
+pydantic
+pydantic-settings
+python-multipart
+rapidfuzz
