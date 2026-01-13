@@ -108,9 +108,12 @@ async def session_start(user_id: str = None):
     
     if redis_client:
         try:
-            from session.store import SessionStore
-            store = SessionStore()
-            await store.start_session(session_id, user_id)
+            data = {
+                "id": session_id,
+                "user_id": user_id,
+                "created": datetime.utcnow().isoformat()
+            }
+            await redis_client.set(f"session:{session_id}", str(data), ex=86400)
             return {"session_id": session_id, "status": "started"}
         except Exception as e:
             log.error(f"Session start failed: {e}")
@@ -126,9 +129,25 @@ async def session_event(
 ):
     if redis_client:
         try:
-            from session.store import SessionStore
-            store = SessionStore()
-            await store.record_event(session_id, event_type, video_id, user_id)
+            data = {
+                "session_id": session_id,
+                "event_type": event_type,
+                "video_id": video_id,
+                "user_id": user_id,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            key = f"event:{session_id}:{datetime.utcnow().timestamp()}"
+            await redis_client.set(key, str(data), ex=604800)
+            
+            # Update user activity
+            if user_id and video_id:
+                activity_key = f"activity:{user_id}"
+                await redis_client.lpush(activity_key, str({
+                    "video_id": video_id,
+                    "event_type": event_type,
+                    "timestamp": datetime.utcnow().isoformat()
+                }))
+                await redis_client.ltrim(activity_key, 0, 49)
             return {"status": "recorded"}
         except Exception as e:
             log.error(f"Session event failed: {e}")
@@ -146,30 +165,69 @@ async def get_recommendations(
         return {"tracks": [], "reason": "service_unavailable"}
     
     try:
-        from recommend.engine import RecommendationEngine
-        engine = RecommendationEngine()
-        return await engine.get_recommendations(current_video_id, user_id, limit)
-    except Exception as e:
-        log.error(f"Recommendations failed: {e}")
         from core.ytmusic_client import search_songs
-        results = search_songs("popular", limit=limit)
+        
+        # Simple recommendation logic
+        if current_video_id:
+            results = search_songs("music", limit=limit)
+        elif user_id and redis_client:
+            # Try to get user's recent activity
+            try:
+                activity_key = f"activity:{user_id}"
+                activities = await redis_client.lrange(activity_key, 0, 4)
+                if activities:
+                    results = search_songs("similar music", limit=limit)
+                else:
+                    results = search_songs("popular", limit=limit)
+            except:
+                results = search_songs("popular", limit=limit)
+        else:
+            results = search_songs("trending", limit=limit)
+        
+        # Add labels
+        labeled_tracks = []
+        for i, track in enumerate(results):
+            label = "Recommended"
+            if i == 0:
+                label = "Top Pick"
+            elif i < 3:
+                label = "Trending"
+            
+            labeled_tracks.append({
+                **track,
+                "label": label,
+                "score": 1.0 - (i * 0.05)
+            })
+        
         return {
-            "tracks": results,
+            "tracks": labeled_tracks,
             "count": len(results),
             "generated_at": datetime.utcnow().isoformat()
         }
+    except Exception as e:
+        log.error(f"Recommendations failed: {e}")
+        return {"tracks": []}
 
-# Cache manifest
+# Cache manifest endpoint
 @app.post("/cache/manifest")
 async def get_cache_manifest(user_id: str = None):
+    if not ytm:
+        return {"must_cache": [], "likely_next": []}
+    
     try:
-        from cache.manifest import CacheManifestGenerator
-        generator = CacheManifestGenerator()
-        return await generator.generate(user_id)
+        from core.ytmusic_client import search_songs
+        
+        # Get popular tracks
+        popular = search_songs("popular music", limit=10)
+        
+        # Get trending tracks
+        trending = search_songs("trending", limit=10)
+        
+        return {
+            "must_cache": popular[:5],
+            "likely_next": trending[:10],
+            "expires_at": int(datetime.utcnow().timestamp()) + 86400
+        }
     except Exception as e:
         log.error(f"Cache manifest failed: {e}")
-        return {
-            "must_cache": [],
-            "likely_next": [],
-            "expires_at": int(datetime.utcnow().timestamp()) + 3600
-        }
+        return {"must_cache": [], "likely_next": []}
