@@ -1,4 +1,4 @@
-# app.py
+# app.py (additions to imports and routes)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import logging
@@ -67,6 +67,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Import new routes
+try:
+    from routes import search, artist, play
+    app.include_router(search.router, prefix="/api/v2", tags=["search"])
+    app.include_router(artist.router, prefix="/api/v2", tags=["artist"])
+    app.include_router(play.router, prefix="/api/v2", tags=["play"])
+    log.info("Enhanced routes loaded")
+except Exception as e:
+    log.warning(f"Could not load enhanced routes: {e}")
+
 # Root
 @app.get("/")
 def root():
@@ -87,7 +97,7 @@ def health():
         "redis": redis_client is not None
     }
 
-# Original search endpoint (preserved)
+# Original search endpoint (preserved - EXACTLY AS IS)
 @app.get("/search")
 async def search(q: str, limit: int = 20):
     if not q or not q.strip():
@@ -103,7 +113,7 @@ async def search(q: str, limit: int = 20):
         log.error(f"Search failed: {e}")
         return []
 
-# Session endpoints
+# Session endpoints (preserved - EXACTLY AS IS)
 @app.post("/session/start")
 async def session_start(user_id: str = None):
     session_id = str(uuid.uuid4())
@@ -156,7 +166,7 @@ async def session_event(
     
     return {"status": "received"}
 
-# Recommendations
+# Recommendations (preserved - EXACTLY AS IS)
 @app.post("/recommend/contextual")
 async def get_recommendations(
     current_video_id: str = None,
@@ -210,7 +220,7 @@ async def get_recommendations(
         log.error(f"Recommendations failed: {e}")
         return {"tracks": []}
 
-# Cache manifest endpoint
+# Cache manifest endpoint (preserved - EXACTLY AS IS)
 @app.post("/cache/manifest")
 async def get_cache_manifest(user_id: str = None):
     if not ytm:
