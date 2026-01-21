@@ -1,5 +1,6 @@
 # redis/client.py
-
+import redis
+print("REDIS VERSION:", redis.__version__)
 import os
 import logging
 from typing import Optional
