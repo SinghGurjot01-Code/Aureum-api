@@ -1,6 +1,4 @@
 # redis/client.py
-import redis
-print("REDIS VERSION:", redis.__version__)
 import os
 import logging
 from typing import Optional
@@ -28,16 +26,17 @@ async def get_redis_client() -> Optional["Redis"]:
     try:
         import redis.asyncio as redis
 
-        _redis_client = redis.from_url(
+        client = redis.from_url(
             redis_url,
             decode_responses=True,
             socket_timeout=5,
             socket_connect_timeout=5,
         )
 
-        # Test connection
-        await _redis_client.ping()
+        # Connection test (ONLY reliable check)
+        await client.ping()
 
+        _redis_client = client
         log.info("Redis connected successfully")
         return _redis_client
 
